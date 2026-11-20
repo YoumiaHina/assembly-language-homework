@@ -1,0 +1,415 @@
+; 作业 6：输入 1900 至 2099 年及月份，输出以星期日开头的月历。
+; MAINCODE 负责输入输出，CALCCODE 负责日期计算，跨段调用使用 FAR。
+; READ_NUMBER 用寄存器传参，FIRST_DAY 用数据段传参，MONTH_LENGTH 用栈传参。
+
+STACKSEG SEGMENT PARA STACK 'STACK'
+    DB 512 DUP (?)
+STACK_TOP LABEL WORD
+STACKSEG ENDS
+
+DATASEG SEGMENT PARA PUBLIC 'DATA'
+    YEAR_PROMPT DB 'Please input year (1900-2099): $'
+    MONTH_PROMPT DB 'Please input month (1-12): $'
+    ERROR_MSG DB 'Invalid input.',13,10,'$'
+    NEWLINE DB 13,10,'$'
+    THREE_SPACES DB '   $'
+    WEEK_HEADER DB 'Su Mo Tu We Th Fr Sa',13,10,'$'
+    INPUT_BUF DB 80,0,80 DUP (0)
+    YEAR_VALUE DW 0
+    MONTH_VALUE DW 0
+    DAY_COUNT DW 0
+    FIRST_COLUMN DW 0
+    MONTH_DAYS DW 31,28,31,30,31,30,31,31,30,31,30,31
+    MONTH_NAMES DW OFFSET JAN_NAME, OFFSET FEB_NAME, OFFSET MAR_NAME
+                DW OFFSET APR_NAME, OFFSET MAY_NAME, OFFSET JUN_NAME
+                DW OFFSET JUL_NAME, OFFSET AUG_NAME, OFFSET SEP_NAME
+                DW OFFSET OCT_NAME, OFFSET NOV_NAME, OFFSET DEC_NAME
+    JAN_NAME DB 'January$'
+    FEB_NAME DB 'February$'
+    MAR_NAME DB 'March$'
+    APR_NAME DB 'April$'
+    MAY_NAME DB 'May$'
+    JUN_NAME DB 'June$'
+    JUL_NAME DB 'July$'
+    AUG_NAME DB 'August$'
+    SEP_NAME DB 'September$'
+    OCT_NAME DB 'October$'
+    NOV_NAME DB 'November$'
+    DEC_NAME DB 'December$'
+DATASEG ENDS
+
+MAINCODE SEGMENT PARA PUBLIC 'CODE'
+    ASSUME CS:MAINCODE, DS:DATASEG, SS:STACKSEG
+START:
+    MOV AX, DATASEG
+    MOV DS, AX
+    MOV AX, STACKSEG
+    CLI
+    MOV SS, AX
+    MOV SP, OFFSET STACK_TOP
+    STI
+
+    ; 寄存器传参：DX 为提示串，BX/CX 为上下限，SI 为最大位数。
+    LEA DX, YEAR_PROMPT
+    MOV BX, 1900
+    MOV CX, 2099
+    MOV SI, 4
+    CALL READ_NUMBER
+    JNC YEAR_OK                 ; 反转条件，跳过下一条近跳转。
+    JMP NEAR PTR INPUT_ERROR    ; 错误处理较远，用 16 位位移到达。
+YEAR_OK:
+    MOV YEAR_VALUE, AX
+    LEA DX, MONTH_PROMPT
+    MOV BX, 1
+    MOV CX, 12
+    MOV SI, 2
+    CALL READ_NUMBER
+    JNC MONTH_OK
+    JMP NEAR PTR INPUT_ERROR
+MONTH_OK:
+    MOV MONTH_VALUE, AX
+
+    ; 栈传参：先压月份，再压年份；被调用者用 RETF 4 清理两个参数。
+    PUSH MONTH_VALUE
+    PUSH YEAR_VALUE
+LENGTH_CALL:
+    CALL FAR PTR MONTH_LENGTH
+LENGTH_DONE:
+    MOV DAY_COUNT, AX
+
+    ; 数据段传参：FIRST_DAY 读取 YEAR_VALUE 和 MONTH_VALUE。
+WEEKDAY_CALL:
+    CALL FAR PTR FIRST_DAY
+WEEKDAY_DONE:
+    MOV FIRST_COLUMN, AX
+    CALL PRINT_CALENDAR
+    MOV AX, 4C00H
+    INT 21H
+
+; 输入返回 AX；成功清 CF，失败置 CF，其他通用寄存器恢复原值。
+; 保存的 BX/CX/SI 分别位于 [BP-2]、[BP-4]、[BP-8]。
+READ_NUMBER PROC NEAR
+    PUSH BP
+    MOV BP, SP
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+    PUSH DI
+    CALL PRINT_STRING
+    LEA DX, INPUT_BUF
+    MOV AH, 0AH
+    INT 21H
+    CALL PRINT_NEWLINE
+    XOR CX, CX
+    MOV CL, INPUT_BUF+1
+    LEA SI, INPUT_BUF+2
+    JCXZ READ_INVALID
+    ; 重定向的 CRLF 输入可能留下 LF，第二次读取时跳过这个前导换行。
+    CMP BYTE PTR [SI], 0AH
+    JNE READ_LENGTH
+    INC SI
+    DEC CX
+READ_LENGTH:
+    JCXZ READ_INVALID
+    CMP CX, [BP-8]
+    JA READ_INVALID
+    XOR AX, AX
+    MOV BX, 10
+READ_DIGIT:
+    MOV DL, [SI]
+    CMP DL, '0'
+    JB READ_INVALID
+    CMP DL, '9'
+    JA READ_INVALID
+    SUB DL, '0'
+    XOR DH, DH
+    PUSH DX                     ; MUL 会改写 DX，先保存当前数字。
+    MUL BX
+    POP DX
+    ADD AX, DX
+    INC SI
+    LOOP READ_DIGIT
+    CMP AX, [BP-2]
+    JB READ_INVALID
+    CMP AX, [BP-4]
+    JA READ_INVALID
+    CLC
+    JMP SHORT READ_RETURN
+READ_INVALID:
+    STC
+READ_RETURN:
+    POP DI
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP BP
+    RET
+READ_NUMBER ENDP
+
+; DX 指向以 '$' 结束的字符串，保存 AX 和 DX。
+PRINT_STRING PROC NEAR
+    PUSH AX
+    PUSH DX
+    MOV AH, 09H
+    INT 21H
+    POP DX
+    POP AX
+    RET
+PRINT_STRING ENDP
+
+; DL 为待输出字符，保存 AX 和 DX。
+PRINT_CHAR PROC NEAR
+    PUSH AX
+    PUSH DX
+    MOV AH, 02H
+    INT 21H
+    POP DX
+    POP AX
+    RET
+PRINT_CHAR ENDP
+
+PRINT_NEWLINE PROC NEAR
+    PUSH DX
+    LEA DX, NEWLINE
+    CALL PRINT_STRING
+    POP DX
+    RET
+PRINT_NEWLINE ENDP
+
+; 输出 AX 中的无符号整数，保存 AX、BX、CX 和 DX。
+PRINT_U16 PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    XOR CX, CX
+    MOV BX, 10
+DEC_DIVIDE:
+    XOR DX, DX
+    DIV BX
+    PUSH DX
+    INC CX
+    OR AX, AX
+    JNZ DEC_DIVIDE
+DEC_OUTPUT:
+    POP DX
+    ADD DL, '0'
+    CALL PRINT_CHAR
+    LOOP DEC_OUTPUT
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+PRINT_U16 ENDP
+
+; 日期按两列右对齐，一位数前补一个空格。
+PRINT_DAY PROC NEAR
+    PUSH DX
+    CMP AX, 10
+    JAE DAY_TWO_DIGITS
+    MOV DL, ' '
+    CALL PRINT_CHAR
+DAY_TWO_DIGITS:
+    CALL PRINT_U16
+    POP DX
+    RET
+PRINT_DAY ENDP
+
+; 从数据段取得日历信息；BX 保存星期列，DI 保存当前日期。
+PRINT_CALENDAR PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH DX
+    PUSH DI
+    CALL PRINT_NEWLINE
+    MOV AX, YEAR_VALUE
+    CALL PRINT_U16
+    MOV DL, ' '
+    CALL PRINT_CHAR
+    CALL PRINT_CHAR
+    MOV BX, MONTH_VALUE
+    DEC BX
+    SHL BX, 1
+    MOV DX, MONTH_NAMES[BX]
+    CALL PRINT_STRING
+    CALL PRINT_NEWLINE
+    LEA DX, WEEK_HEADER
+    CALL PRINT_STRING
+
+    MOV BX, FIRST_COLUMN
+LEADING_BLANKS:
+    OR BX, BX
+    JZ DATES_BEGIN
+    LEA DX, THREE_SPACES
+    CALL PRINT_STRING
+    DEC BX
+    JMP SHORT LEADING_BLANKS
+DATES_BEGIN:
+    MOV BX, FIRST_COLUMN
+    MOV DI, 1
+DATE_LOOP:
+    MOV AX, DI
+    CALL PRINT_DAY
+    INC BX
+    CMP BX, 7
+    JB DATE_SAME_LINE
+    CALL PRINT_NEWLINE
+    XOR BX, BX
+    JMP SHORT DATE_NEXT
+DATE_SAME_LINE:
+    CMP DI, DAY_COUNT
+    JAE DATE_NEXT
+    MOV DL, ' '
+    CALL PRINT_CHAR
+DATE_NEXT:
+    INC DI
+    CMP DI, DAY_COUNT
+    JBE DATE_LOOP
+    OR BX, BX
+    JZ CALENDAR_RETURN
+    CALL PRINT_NEWLINE
+CALENDAR_RETURN:
+    POP DI
+    POP DX
+    POP BX
+    POP AX
+    RET
+PRINT_CALENDAR ENDP
+
+INPUT_ERROR:
+    LEA DX, ERROR_MSG
+    CALL PRINT_STRING
+    MOV AX, 4C01H
+    INT 21H
+MAINCODE ENDS
+
+CALCCODE SEGMENT PARA PUBLIC 'CODE'
+    ASSUME CS:CALCCODE, DS:DATASEG, SS:STACKSEG
+
+; 栈传参的远过程：AX 返回天数，保留其余使用的寄存器。
+; FAR CALL 压入 CS、IP，PUSH BP 后 [BP+6] 为年，[BP+8] 为月。
+MONTH_LENGTH PROC FAR
+    PUSH BP
+    MOV BP, SP
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+    MOV AX, [BP+6]
+    CALL IS_LEAP
+    MOV DX, AX
+    MOV SI, [BP+8]
+    DEC SI
+    SHL SI, 1
+    MOV AX, MONTH_DAYS[SI]
+    CMP WORD PTR [BP+8], 2
+    JNE LENGTH_RETURN
+    ADD AX, DX
+LENGTH_RETURN:
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP BP
+LENGTH_RET:
+    RETF 4                      ; 弹出 IP、CS，再释放 4 字节参数。
+MONTH_LENGTH ENDP
+
+; 数据段传参的远过程：读取年份和月份，AX 返回星期日为 0 的列号。
+; 以 1900 年 1 月 1 日为星期一，逐年、逐月累加并对 7 取余。
+FIRST_DAY PROC FAR
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+    PUSH DI
+    MOV SI, 1900
+    MOV DI, 1
+YEAR_LOOP:
+    CMP SI, YEAR_VALUE
+    JAE MONTHS_BEGIN
+    MOV AX, SI
+    CALL IS_LEAP
+    INC AX                      ; 平年星期前移 1 列，闰年前移 2 列。
+    ADD DI, AX
+    CMP DI, 7
+    JB YEAR_NEXT
+    SUB DI, 7
+YEAR_NEXT:
+    INC SI
+    JMP SHORT YEAR_LOOP
+MONTHS_BEGIN:
+    MOV SI, 1
+MONTH_LOOP:
+    CMP SI, MONTH_VALUE
+    JAE WEEKDAY_RETURN
+    MOV BX, SI
+    DEC BX
+    SHL BX, 1
+    MOV CX, MONTH_DAYS[BX]
+    CMP SI, 2
+    JNE MONTH_ADD
+    MOV AX, YEAR_VALUE
+    CALL IS_LEAP
+    ADD CX, AX
+MONTH_ADD:
+    MOV AX, DI
+    ADD AX, CX
+    XOR DX, DX
+    MOV BX, 7
+    DIV BX
+    MOV DI, DX
+    INC SI
+    JMP SHORT MONTH_LOOP
+WEEKDAY_RETURN:
+    MOV AX, DI
+    POP DI
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+WEEKDAY_RET:
+    RETF                        ; 远返回同时恢复 IP 和 CS。
+FIRST_DAY ENDP
+
+; 寄存器传参的近过程：AX 输入年份，AX 返回 1 表示闰年、0 表示平年。
+; 能被 400 整除，或能被 4 整除且不能被 100 整除，即为闰年。
+IS_LEAP PROC NEAR
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    MOV CX, AX
+    XOR DX, DX
+    MOV BX, 400
+    DIV BX
+    OR DX, DX
+    JZ LEAP_YES
+    MOV AX, CX
+    XOR DX, DX
+    MOV BX, 100
+    DIV BX
+    OR DX, DX
+    JZ LEAP_NO
+    MOV AX, CX
+    XOR DX, DX
+    MOV BX, 4
+    DIV BX
+    OR DX, DX
+    JNZ LEAP_NO
+LEAP_YES:
+    MOV AX, 1
+    JMP SHORT LEAP_RETURN
+LEAP_NO:
+    XOR AX, AX
+LEAP_RETURN:
+    POP DX
+    POP CX
+    POP BX
+    RET
+IS_LEAP ENDP
+CALCCODE ENDS
+
+END START
